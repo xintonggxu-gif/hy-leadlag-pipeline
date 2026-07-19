@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# macOS
+.DS_Store
+
+# Market data
+*.parquet
+*.duckdb
+*.db
+
+# Local outputs
+test_compacted/
+test_run/
+duckdb_tmp/
+
+# Temporary files
+*.tmp
+*.lock

@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import re
+import shutil
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -14,9 +15,10 @@ import duckdb
 from common import (
     build_scan_expr,
     build_ts_expr,
-    choose_timestamp_col,
+    choose_timestamp_basis_col,
     get_columns,
     load_excluded_hours,
+    order_cols_for_dedup,
     parse_dt,
     read_csv_rows,
     resolve_excluded_hours_path,
@@ -26,14 +28,38 @@ from common import (
 
 
 DATE_RE = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
-CACHE_CONFIG_VERSION = 2
+CACHE_CONFIG_VERSION = 4
 
 
 def quality_by_key(path: str) -> dict[tuple[str, str, str], dict[str, str]]:
-    return {
-        (r["exchange"], r["market_type"], r["symbol"]): r
-        for r in read_csv_rows(path)
+    rows = read_csv_rows(path)
+    if not rows:
+        raise ValueError(f"empty quality CSV: {path}")
+    required = {
+        "exchange",
+        "market_type",
+        "symbol",
+        "parquet_glob",
+        "timestamp_basis",
+        "timestamp_col",
+        "duplicate_ts_policy",
+        "duplicate_ts",
+        "scan_config_hash",
+        "scan_ts_unit",
+        "scan_price_mode",
+        "recommended_max_interval_ms",
+        "recommended_max_spread_bps",
     }
+    missing = required - set(rows[0])
+    if missing:
+        raise ValueError(f"quality CSV missing columns: {sorted(missing)}")
+    result: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in rows:
+        key = (row["exchange"], row["market_type"], row["symbol"])
+        if key in result:
+            raise ValueError(f"duplicate quality row for instrument: {key}")
+        result[key] = row
+    return result
 
 
 def is_bad_number(x: float) -> bool:
@@ -50,6 +76,18 @@ def parse_positive_float(value: str | None) -> float | None:
     if is_bad_number(x) or x <= 0:
         return None
     return x
+
+
+def ensure_free_disk(path: Path, min_free_gb: float, label: str) -> None:
+    if min_free_gb <= 0:
+        return
+    free = shutil.disk_usage(path).free
+    required = int(min_free_gb * 1024 ** 3)
+    if free < required:
+        raise RuntimeError(
+            f"Only {free / 1024 ** 3:.1f}GiB free on {label} filesystem at "
+            f"{path}; require at least {min_free_gb:.1f}GiB"
+        )
 
 
 def floor_to_hour(dt: datetime) -> datetime:
@@ -314,6 +352,8 @@ def build_copy_sql(
     row: dict[str, str],
     scan: str,
     ts_expr: str,
+    dedup_order_by: str,
+    duplicate_ts_policy: str,
     price_mode: str,
     max_interval_ms: float,
     max_spread_bps: float,
@@ -334,9 +374,32 @@ def build_copy_sql(
         for hour_start in sorted(excluded_hours)
     )
 
-    # Compacted input is assumed to be strictly increasing and unique by
-    # receive timestamp. Empty OVER clauses follow preserved input order and
-    # avoid ROW_NUMBER, deduplication, and timestamp sorting.
+    if duplicate_ts_policy == "keep-last":
+        selection_ctes = f"""
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ts ORDER BY {dedup_order_by}
+                ) AS _dedup_rank
+            FROM time_filtered
+        ),
+        selected AS (
+            SELECT * EXCLUDE (_dedup_rank)
+            FROM ranked
+            WHERE _dedup_rank = 1
+        )
+        """
+    elif duplicate_ts_policy == "error":
+        selection_ctes = """
+        selected AS (
+            SELECT * FROM time_filtered
+        )
+        """
+    else:
+        raise ValueError(
+            f"unsupported duplicate timestamp policy: {duplicate_ts_policy}"
+        )
 
     scan_time_filter = f"ts >= {ts_lit(scan_start)} AND ts < {ts_lit(chunk_end)}"
     output_time_filter = f"end_ts >= {ts_lit(chunk_start)} AND end_ts < {ts_lit(chunk_end)}"
@@ -345,44 +408,51 @@ def build_copy_sql(
     COPY (
         WITH raw AS (
             SELECT
+                *,
                 {sql_quote(row['exchange'])} AS exchange,
                 {sql_quote(row['market_type'])} AS market_type,
-                CAST(symbol AS VARCHAR) AS symbol,
                 {ts_expr} AS ts,
-                CAST(bid_price AS DOUBLE) AS bid_price,
-                CAST(ask_price AS DOUBLE) AS ask_price,
-                CAST(bid_qty AS DOUBLE) AS bid_qty,
-                CAST(ask_qty AS DOUBLE) AS ask_qty
+                CAST(bid_price AS DOUBLE) AS _bid_price,
+                CAST(ask_price AS DOUBLE) AS _ask_price,
+                CAST(bid_qty AS DOUBLE) AS _bid_qty,
+                CAST(ask_qty AS DOUBLE) AS _ask_qty
             FROM {scan}
             WHERE CAST(symbol AS VARCHAR) = {sql_quote(row['symbol'])}
         ),
-        enriched AS (
-            SELECT
-                *,
-                (bid_price + ask_price) / 2.0 AS mid,
-                CASE
-                    WHEN bid_qty > 0 AND ask_qty > 0
-                    THEN (bid_price * ask_qty + ask_price * bid_qty) / (bid_qty + ask_qty)
-                    ELSE NULL
-                END AS microprice,
-                10000.0 * (ask_price - bid_price) / ((bid_price + ask_price) / 2.0) AS spread_bps
+        time_filtered AS (
+            SELECT *
             FROM raw
             WHERE {scan_time_filter}
               AND ts IS NOT NULL
               AND isfinite(ts)
-              AND bid_price IS NOT NULL
-              AND ask_price IS NOT NULL
-              AND bid_qty IS NOT NULL
-              AND ask_qty IS NOT NULL
-              AND isfinite(bid_price)
-              AND isfinite(ask_price)
-              AND isfinite(bid_qty)
-              AND isfinite(ask_qty)
-              AND bid_price > 0
-              AND ask_price > 0
-              AND bid_qty > 0
-              AND ask_qty > 0
-              AND bid_price < ask_price
+        ),
+        {selection_ctes},
+        enriched AS (
+            SELECT
+                *,
+                (_bid_price + _ask_price) / 2.0 AS mid,
+                CASE
+                    WHEN _bid_qty > 0 AND _ask_qty > 0
+                    THEN (_bid_price * _ask_qty + _ask_price * _bid_qty)
+                         / (_bid_qty + _ask_qty)
+                    ELSE NULL
+                END AS microprice,
+                10000.0 * (_ask_price - _bid_price)
+                    / ((_bid_price + _ask_price) / 2.0) AS spread_bps
+            FROM selected
+            WHERE _bid_price IS NOT NULL
+              AND _ask_price IS NOT NULL
+              AND _bid_qty IS NOT NULL
+              AND _ask_qty IS NOT NULL
+              AND isfinite(_bid_price)
+              AND isfinite(_ask_price)
+              AND isfinite(_bid_qty)
+              AND isfinite(_ask_qty)
+              AND _bid_price > 0
+              AND _ask_price > 0
+              AND _bid_qty > 0
+              AND _ask_qty > 0
+              AND _bid_price < _ask_price
         ),
         filtered AS (
             SELECT *
@@ -398,7 +468,7 @@ def build_copy_sql(
             SELECT
                 exchange,
                 market_type,
-                symbol,
+                CAST(symbol AS VARCHAR) AS symbol,
                 ts,
                 spread_bps,
                 {selected_price} AS price
@@ -409,9 +479,9 @@ def build_copy_sql(
                 exchange,
                 market_type,
                 symbol,
-                LAG(ts) OVER () AS start_ts,
+                LAG(ts) OVER (ORDER BY ts) AS start_ts,
                 ts AS end_ts,
-                LAG(price) OVER () AS prev_price,
+                LAG(price) OVER (ORDER BY ts) AS prev_price,
                 price,
                 spread_bps,
                 CAST(ts AS DATE) AS date
@@ -472,7 +542,26 @@ def main() -> None:
     parser.add_argument("--out", required=True, help="interval_cache directory")
     parser.add_argument("--start")
     parser.add_argument("--end")
+    parser.add_argument(
+        "--max-lag-ms",
+        type=int,
+        default=0,
+        help=(
+            "Expand explicit --start/--end by this lag on both sides when "
+            "building cache coverage. Use the same value as stage 05."
+        ),
+    )
     parser.add_argument("--timestamp-col")
+    parser.add_argument(
+        "--timestamp-basis",
+        choices=["receive", "event", "transaction"],
+        help="Must match the timestamp basis recorded by stage 02/03.",
+    )
+    parser.add_argument(
+        "--duplicate-ts-policy",
+        choices=["error", "keep-last"],
+        help="Must match the duplicate policy recorded by stage 02/03.",
+    )
     parser.add_argument("--ts-unit", choices=["timestamp", "ns", "us", "ms"], default="timestamp")
     parser.add_argument("--price-mode", choices=["mid", "microprice"], default="mid")
     parser.add_argument("--min-interval-ms", type=float, default=0.0)
@@ -485,6 +574,8 @@ def main() -> None:
     )
     parser.add_argument("--memory-limit", default="2GB")
     parser.add_argument("--temp-dir", default="./duckdb_tmp")
+    parser.add_argument("--max-temp-size", default="8GB")
+    parser.add_argument("--min-free-disk-gb", type=float, default=3.0)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument(
         "--chunk-minutes",
@@ -512,21 +603,55 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.threads <= 0:
-        raise SystemExit("--threads must be > 0")
-    if args.chunk_minutes <= 0:
-        raise SystemExit("--chunk-minutes must be > 0")
-    if args.min_interval_ms < 0:
-        raise SystemExit("--min-interval-ms must be >= 0")
+    if args.timestamp_col and args.timestamp_basis:
+        raise SystemExit(
+            "use either --timestamp-col or --timestamp-basis, not both"
+        )
 
-    out_dir = Path(args.out)
+    if args.threads != 1:
+        raise SystemExit(
+            "--threads must be 1 because interval construction relies on "
+            "validated physical row order"
+        )
+    if not math.isfinite(args.chunk_minutes) or args.chunk_minutes <= 0:
+        raise SystemExit("--chunk-minutes must be finite and > 0")
+    if not math.isfinite(args.min_interval_ms) or args.min_interval_ms < 0:
+        raise SystemExit("--min-interval-ms must be finite and >= 0")
+    if (
+        not math.isfinite(args.boundary_extra_ms)
+        or args.boundary_extra_ms < 0
+    ):
+        raise SystemExit("--boundary-extra-ms must be finite and >= 0")
+    if args.max_lag_ms < 0:
+        raise SystemExit("--max-lag-ms must be >= 0")
+    if (
+        not math.isfinite(args.min_free_disk_gb)
+        or args.min_free_disk_gb < 0
+    ):
+        raise SystemExit("--min-free-disk-gb must be finite and >= 0")
+
+    out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    Path(args.temp_dir).mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(args.temp_dir).expanduser().resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    ensure_free_disk(out_dir, args.min_free_disk_gb, "output")
+    ensure_free_disk(temp_dir, args.min_free_disk_gb, "temp")
 
-    requested_start = parse_dt(args.start)
-    requested_end = parse_dt(args.end)
-    if requested_start and requested_end and requested_start >= requested_end:
+    analysis_start = parse_dt(args.start)
+    analysis_end = parse_dt(args.end)
+    if analysis_start and analysis_end and analysis_start >= analysis_end:
         raise SystemExit("--start must be earlier than --end")
+    if args.max_lag_ms > 0 and (
+        analysis_start is None or analysis_end is None
+    ):
+        raise SystemExit(
+            "--start and --end are both required when --max-lag-ms > 0"
+        )
+    lag_buffer = timedelta(milliseconds=args.max_lag_ms)
+    requested_start = (
+        analysis_start - lag_buffer if analysis_start is not None else None
+    )
+    requested_end = analysis_end + lag_buffer if analysis_end is not None else None
 
     excluded_path = resolve_excluded_hours_path(
         args.universe, args.excluded_hours
@@ -542,13 +667,12 @@ def main() -> None:
     con = duckdb.connect()
     con.execute("SET TimeZone = 'UTC';")
     con.execute(f"SET memory_limit = {sql_quote(args.memory_limit)};")
-    con.execute(f"SET temp_directory = {sql_quote(args.temp_dir)};")
+    con.execute(f"SET temp_directory = {sql_quote(str(temp_dir))};")
+    con.execute(
+        f"SET max_temp_directory_size = {sql_quote(args.max_temp_size)};"
+    )
     con.execute(f"SET threads = {args.threads};")
     con.execute("SET preserve_insertion_order = true;")
-    print(
-        "[ASSUMPTION] input receive timestamps are strictly increasing "
-        "and unique in parquet file order"
-    )
 
     q = quality_by_key(args.quality)
     rows = read_csv_rows(args.universe)
@@ -560,6 +684,70 @@ def main() -> None:
         if quality is None:
             print(f"[WARN] skip {key}: no quality/cap row")
             continue
+        if quality.get("parquet_glob") != row.get("parquet_glob"):
+            raise RuntimeError(
+                f"quality/universe source mismatch for {key}: "
+                f"quality={quality.get('parquet_glob')!r} "
+                f"universe={row.get('parquet_glob')!r}"
+            )
+        quality_basis = quality.get("timestamp_basis")
+        universe_basis = row.get("timestamp_basis")
+        if universe_basis and universe_basis != quality_basis:
+            raise RuntimeError(
+                f"universe/quality timestamp basis mismatch for {key}: "
+                f"universe={universe_basis!r} quality={quality_basis!r}"
+            )
+        universe_timestamp_col = row.get("timestamp_col")
+        if (
+            universe_timestamp_col
+            and universe_timestamp_col != quality.get("timestamp_col")
+        ):
+            raise RuntimeError(
+                f"universe/quality timestamp column mismatch for {key}: "
+                f"universe={universe_timestamp_col!r} "
+                f"quality={quality.get('timestamp_col')!r}"
+            )
+        timestamp_basis = (
+            "custom"
+            if args.timestamp_col
+            else (args.timestamp_basis or quality_basis)
+        )
+        if timestamp_basis != quality_basis:
+            raise RuntimeError(
+                f"quality for {key} used timestamp_basis={quality_basis!r}, "
+                f"but cache requested {timestamp_basis!r}"
+            )
+        quality_duplicate_policy = quality.get("duplicate_ts_policy")
+        duplicate_ts_policy = (
+            args.duplicate_ts_policy or quality_duplicate_policy
+        )
+        if duplicate_ts_policy != quality_duplicate_policy:
+            raise RuntimeError(
+                f"quality for {key} used duplicate_ts_policy="
+                f"{quality_duplicate_policy!r}, but cache requested "
+                f"{duplicate_ts_policy!r}"
+            )
+        if duplicate_ts_policy == "error":
+            duplicate_count = int(float(quality.get("duplicate_ts") or 0))
+            if duplicate_count > 0:
+                raise RuntimeError(
+                    f"quality found {duplicate_count} duplicate timestamps for "
+                    f"{key}; rebuild quality/cache with "
+                    "--duplicate-ts-policy keep-last"
+                )
+        if quality.get("scan_ts_unit") != args.ts_unit:
+            raise RuntimeError(
+                f"quality for {key} used ts_unit={quality.get('scan_ts_unit')!r}, "
+                f"but cache requested ts_unit={args.ts_unit!r}"
+            )
+        if quality.get("scan_price_mode") != args.price_mode:
+            raise RuntimeError(
+                f"quality for {key} used price_mode="
+                f"{quality.get('scan_price_mode')!r}, but cache requested "
+                f"price_mode={args.price_mode!r}"
+            )
+        if not quality.get("scan_config_hash"):
+            raise RuntimeError(f"quality row has no scan_config_hash for {key}")
 
         max_interval_ms = parse_positive_float(quality.get("recommended_max_interval_ms"))
         max_spread_bps = parse_positive_float(quality.get("recommended_max_spread_bps"))
@@ -587,7 +775,11 @@ def main() -> None:
 
             first_scan = build_scan_expr(first_file, True)
             cols = get_columns(con, first_scan)
-            ts_col = choose_timestamp_col(cols, args.timestamp_col or quality.get("timestamp_col") or None)
+            ts_col = choose_timestamp_basis_col(
+                cols,
+                timestamp_basis,
+                args.timestamp_col or quality.get("timestamp_col") or None,
+            )
             ts_expr = build_ts_expr(ts_col, args.ts_unit)
             full_scan = build_scan_expr(row["parquet_glob"], True)
             start, end = resolve_bounds(
@@ -612,8 +804,18 @@ def main() -> None:
 
         schema_scan = build_scan_expr(schema_file, True)
         cols = get_columns(con, schema_scan)
-        ts_col = choose_timestamp_col(cols, args.timestamp_col or quality.get("timestamp_col") or None)
+        ts_col = choose_timestamp_basis_col(
+            cols,
+            timestamp_basis,
+            args.timestamp_col or quality.get("timestamp_col") or None,
+        )
+        if ts_col != quality.get("timestamp_col"):
+            raise RuntimeError(
+                f"quality/cache timestamp column mismatch for {key}: "
+                f"quality={quality.get('timestamp_col')!r} cache={ts_col!r}"
+            )
         ts_expr = build_ts_expr(ts_col, args.ts_unit)
+        dedup_order_by = order_cols_for_dedup(cols)
         target = (
             out_dir
             / f"exchange={row['exchange']}"
@@ -632,10 +834,29 @@ def main() -> None:
             "source_parquet_glob": row["parquet_glob"],
             "start": start.isoformat(timespec="microseconds"),
             "end": end.isoformat(timespec="microseconds"),
+            "analysis_start": (
+                analysis_start.isoformat(timespec="microseconds")
+                if analysis_start is not None
+                else None
+            ),
+            "analysis_end": (
+                analysis_end.isoformat(timespec="microseconds")
+                if analysis_end is not None
+                else None
+            ),
+            "max_lag_ms": args.max_lag_ms,
+            "timestamp_basis": timestamp_basis,
             "timestamp_col": ts_col,
+            "duplicate_ts_policy": duplicate_ts_policy,
+            "dedup_order_by": dedup_order_by,
             "ts_unit": args.ts_unit,
             "price_mode": args.price_mode,
-            "input_mode": "streaming_sorted_unique",
+            "quality_scan_config_hash": quality["scan_config_hash"],
+            "input_mode": (
+                "ordered_deduplicated_keep_last"
+                if duplicate_ts_policy == "keep-last"
+                else "streaming_sorted_unique"
+            ),
             "chunk_minutes": args.chunk_minutes,
             "boundary_extra_ms": args.boundary_extra_ms,
             "min_interval_ms": args.min_interval_ms,
@@ -664,7 +885,7 @@ def main() -> None:
             f"cap={max_interval_ms:.3f}ms spread={max_spread_bps:.3f}bps "
             f"mem={args.memory_limit} threads={args.threads} "
             f"excluded_hours={len(run_excluded_hours)} "
-            "mode=streaming-sorted-input"
+            f"basis={timestamp_basis} dedup={duplicate_ts_policy}"
         )
 
         lookback_ms = max_interval_ms + max(0.0, args.boundary_extra_ms)
@@ -689,8 +910,8 @@ def main() -> None:
             date_dir.mkdir(parents=True, exist_ok=True)
             out_file = date_dir / (
                 f"{args.price_mode}_"
-                f"chunk_start={chunk_start:%Y%m%dT%H%M%S}_"
-                f"chunk_end={chunk_end:%Y%m%dT%H%M%S}.parquet"
+                f"chunk_start={chunk_start:%Y%m%dT%H%M%S.%f}_"
+                f"chunk_end={chunk_end:%Y%m%dT%H%M%S.%f}.parquet"
             )
             if out_file.exists() and not args.rebuild_existing:
                 skipped_existing += 1
@@ -704,6 +925,8 @@ def main() -> None:
                 row=row,
                 scan=scan,
                 ts_expr=ts_expr,
+                dedup_order_by=dedup_order_by,
+                duplicate_ts_policy=duplicate_ts_policy,
                 price_mode=args.price_mode,
                 max_interval_ms=max_interval_ms,
                 max_spread_bps=max_spread_bps,
@@ -721,6 +944,8 @@ def main() -> None:
                 out_file=tmp_file,
             )
             try:
+                ensure_free_disk(out_dir, args.min_free_disk_gb, "output")
+                ensure_free_disk(temp_dir, args.min_free_disk_gb, "temp")
                 con.execute(sql)
                 tmp_file.replace(out_file)
             except Exception:

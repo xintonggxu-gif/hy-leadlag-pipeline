@@ -170,9 +170,11 @@ def get_columns(con, scan: str) -> set[str]:
 def choose_timestamp_col(cols: set[str], explicit: str | None = None) -> str:
     """Choose the timestamp column used as the event/receive time.
 
-    For your pipeline, prefer recv_time_us when available. In production runs,
-    still pass --timestamp-col recv_time_us --ts-unit us explicitly to avoid
-    accidental unit mismatches.
+    The compacted Binance/Bybit files store recv_time_us/recv_time_ns as
+    TIMESTAMP WITH TIME ZONE values.  The suffix describes the source field,
+    not an integer epoch unit, so these columns must normally be used with
+    --ts-unit timestamp.  Column selection stays per instrument because Spot
+    and Bybit use recv_time_ns while Binance perpetuals use recv_time_us.
     """
     if explicit:
         if explicit not in cols:
@@ -184,6 +186,50 @@ def choose_timestamp_col(cols: set[str], explicit: str | None = None) -> str:
             return col
 
     raise RuntimeError(f"Cannot infer timestamp column; available={sorted(cols)}")
+
+
+def choose_timestamp_basis_col(
+    cols: set[str],
+    basis: str,
+    explicit: str | None = None,
+) -> str:
+    """Resolve a timestamp basis without silently falling back to another clock."""
+    if explicit:
+        if explicit not in cols:
+            raise RuntimeError(
+                f"timestamp column not found: {explicit}; available={sorted(cols)}"
+            )
+        return explicit
+
+    if basis == "receive":
+        for col in (
+            "recv_time_us",
+            "recv_time_ns",
+            "recv_time_ms",
+            "recv_time",
+            "receive_time",
+            "receive_ts",
+            "received_ts",
+            "recv_ts",
+        ):
+            if col in cols:
+                return col
+    elif basis == "event":
+        for col in ("event_time", "event_ts", "E"):
+            if col in cols:
+                return col
+    elif basis == "transaction":
+        for col in ("transaction_time", "transaction_ts", "T"):
+            if col in cols:
+                return col
+    elif basis == "custom":
+        raise RuntimeError("custom timestamp basis requires --timestamp-col")
+    else:
+        raise ValueError(f"unsupported timestamp basis: {basis!r}")
+
+    raise RuntimeError(
+        f"no {basis!r} timestamp column found; available={sorted(cols)}"
+    )
 
 
 def build_ts_expr(timestamp_col: str, ts_unit: str) -> str:
@@ -209,13 +255,27 @@ def order_cols_for_dedup(cols: set[str]) -> str:
     pieces: list[str] = []
 
     # Exchange/order-book sequence fields: larger usually means later.
-    for col in ("update_id", "u", "last_update_id", "cross_seq", "sequence", "seq"):
+    for col in (
+        "cross_seq",
+        "seq",
+        "sequence",
+        "update_id",
+        "u",
+        "last_update_id",
+    ):
         if col in cols:
             pieces.append(f"CAST({ident(col)} AS BIGINT) DESC NULLS LAST")
 
     # Time-like fields: use as secondary order when available. Do not cast here;
     # they may already be TIMESTAMP, BIGINT, or another orderable type.
     for col in ("transaction_time", "event_time", "T", "E"):
+        if col in cols:
+            pieces.append(f"{ident(col)} DESC NULLS LAST")
+
+    # If exchange sequence fields tie or are missing, prefer the update that
+    # arrived last at the collector.  The compacted receive columns are typed
+    # timestamps despite their historical suffixes.
+    for col in ("recv_time_us", "recv_time_ns", "recv_time"):
         if col in cols:
             pieces.append(f"{ident(col)} DESC NULLS LAST")
 

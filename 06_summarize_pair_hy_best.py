@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import csv
 import glob
 import json
 import math
@@ -17,7 +18,7 @@ import duckdb
 from common import sql_quote
 
 
-SCRIPT_VERSION = "3.2.0"
+SCRIPT_VERSION = "3.3.0"
 
 PAIR_ID_COLS = [
     "x_exchange", "x_market_type", "x_symbol",
@@ -47,7 +48,8 @@ REQUIRED_COMPONENT_COLS = set(
     PRIMARY_KEY_COLS
     + CACHE_META_COLS
     + [
-        "run_id", "config_hash", "cov", "var_x", "var_y",
+        "run_id", "config_hash", "x_base_asset", "y_base_asset",
+        "cov", "var_x", "var_y",
         "n_overlap", "n_x", "n_y", "corr_is_diagnostic",
     ]
 )
@@ -92,6 +94,34 @@ def discover_components(pattern: str, max_files: int) -> list[Path]:
             f"--max-component-files={max_files:,}"
         )
     return paths
+
+
+def count_pairs_csv(path: str | Path) -> int:
+    pairs_path = Path(path).expanduser().resolve()
+    if not pairs_path.is_file():
+        raise FileNotFoundError(pairs_path)
+    with pairs_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "x_exchange",
+            "x_market_type",
+            "x_symbol",
+            "y_exchange",
+            "y_market_type",
+            "y_symbol",
+        }
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(
+                f"pairs CSV {pairs_path} is missing columns {sorted(missing)}"
+            )
+        pairs = {
+            tuple(row[column] for column in PAIR_ID_COLS)
+            for row in reader
+        }
+    if not pairs:
+        raise RuntimeError(f"pairs CSV contains no pairs: {pairs_path}")
+    return len(pairs)
 
 
 def load_success_markers(
@@ -220,8 +250,15 @@ def main() -> None:
     parser.add_argument(
         "--expected-pairs",
         type=int,
-        default=43,
-        help="Require exactly this many distinct pairs; 0 disables the check.",
+        default=0,
+        help=(
+            "Require exactly this many distinct pairs. 0 uses --pairs-csv when "
+            "provided, otherwise disables the count check."
+        ),
+    )
+    parser.add_argument(
+        "--pairs-csv",
+        help="Optional pairs.csv from stage 01; derives the expected pair count.",
     )
     parser.add_argument("--expected-config-hash")
     parser.add_argument("--max-component-files", type=int, default=1_000)
@@ -261,6 +298,18 @@ def main() -> None:
         parser.error("--max-component-rows must be > 0")
     if args.min_free_disk_gb < 0:
         parser.error("--min-free-disk-gb must be >= 0")
+
+    pairs_csv_count = count_pairs_csv(args.pairs_csv) if args.pairs_csv else 0
+    if (
+        args.expected_pairs > 0
+        and pairs_csv_count > 0
+        and args.expected_pairs != pairs_csv_count
+    ):
+        parser.error(
+            f"--expected-pairs={args.expected_pairs} disagrees with "
+            f"--pairs-csv count={pairs_csv_count}"
+        )
+    effective_expected_pairs = args.expected_pairs or pairs_csv_count
 
     component_paths = discover_components(args.components, args.max_component_files)
     markers = load_success_markers(component_paths, args.allow_cross_base_asset)
@@ -379,6 +428,7 @@ def main() -> None:
            OR n_overlap IS NULL OR n_overlap < 0
            OR n_x IS NULL OR n_x < 0
            OR n_y IS NULL OR n_y < 0
+           OR corr_is_diagnostic IS DISTINCT FROM true
         LIMIT 1
     """).fetchone()
     if invalid_row is not None:
@@ -468,10 +518,10 @@ def main() -> None:
         SELECT count(*)
         FROM (SELECT DISTINCT {', '.join(PAIR_ID_COLS)} FROM {source})
     """).fetchone()[0])
-    if args.expected_pairs > 0 and pair_count != args.expected_pairs:
+    if effective_expected_pairs > 0 and pair_count != effective_expected_pairs:
         raise RuntimeError(
-            f"Found {pair_count} distinct pairs; expected {args.expected_pairs}. "
-            "For the 35-instrument equal-base universe this must be 43."
+            f"Found {pair_count} distinct pairs; expected "
+            f"{effective_expected_pairs}."
         )
 
     incomplete_lags = con.execute(f"""
@@ -560,16 +610,26 @@ def main() -> None:
         FROM {source}
         GROUP BY {lag_group_by}
     )
+    , scored AS (
+        SELECT
+            *,
+            CASE
+                WHEN isfinite(sum_cov)
+                 AND isfinite(sum_var_x) AND sum_var_x > 0
+                 AND isfinite(sum_var_y) AND sum_var_y > 0
+                THEN sum_cov / (sqrt(sum_var_x) * sqrt(sum_var_y))
+                ELSE NULL
+            END AS agg_corr
+        FROM aggregated
+    )
     SELECT
         *,
+        true AS corr_is_diagnostic,
         CASE
-            WHEN isfinite(sum_cov)
-             AND isfinite(sum_var_x) AND sum_var_x > 0
-             AND isfinite(sum_var_y) AND sum_var_y > 0
-            THEN sum_cov / (sqrt(sum_var_x) * sqrt(sum_var_y))
-            ELSE NULL
-        END AS agg_corr
-    FROM aggregated;
+            WHEN agg_corr IS NULL THEN NULL
+            ELSE ABS(agg_corr) > 1.0
+        END AS corr_outside_unit_interval
+    FROM scored;
     """)
 
     # Best by absolute correlation. This is useful for anomaly discovery, but a negative
@@ -611,6 +671,8 @@ def main() -> None:
         {comma(prefixed(group_keys, 'r'))},
         r.lag_ms AS best_lag_ms,
         r.agg_corr AS best_agg_corr,
+        r.corr_is_diagnostic,
+        r.corr_outside_unit_interval,
         CASE WHEN r.agg_corr < 0 THEN true ELSE false END AS best_is_negative,
         z.corr_0_lag,
         z.overlap_0_lag,
@@ -682,6 +744,8 @@ def main() -> None:
         {comma(prefixed(group_keys, 'r'))},
         r.lag_ms AS best_positive_lag_ms,
         r.agg_corr AS best_positive_agg_corr,
+        r.corr_is_diagnostic,
+        r.corr_outside_unit_interval,
         z.corr_0_lag,
         z.overlap_0_lag,
         r.agg_corr - z.corr_0_lag AS best_positive_minus_zero_corr,
@@ -756,7 +820,12 @@ def main() -> None:
                 "input_component_rows": total_component_rows,
                 "input_component_files": len(component_paths),
                 "distinct_pairs": pair_count,
-                "expected_pairs": args.expected_pairs,
+                "expected_pairs": effective_expected_pairs,
+                "pairs_csv": (
+                    str(Path(args.pairs_csv).expanduser().resolve())
+                    if args.pairs_csv
+                    else None
+                ),
                 "expected_lag_count": expected_lag_count,
                 "lag_summary_rows": lag_summary_rows,
                 "best_abs_rows": best_abs_rows,

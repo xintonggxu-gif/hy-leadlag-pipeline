@@ -35,10 +35,12 @@ from common import dt_to_ns, instrument_key, ns_to_dt, parse_dt, sql_quote
 
 EMPTY_I64 = np.array([], dtype=np.int64)
 EMPTY_F64 = np.array([], dtype=np.float64)
-SCRIPT_VERSION = "3.3.0"
+SCRIPT_VERSION = "3.5.0"
 ESTIMATED_CSV_BYTES_PER_ROW = 600
+SUPPORTED_CACHE_CONFIG_VERSIONS = {2, 3, 4}
 CHUNK_RE = re.compile(
-    r"chunk_start=(\d{8}T\d{6})_chunk_end=(\d{8}T\d{6})"
+    r"chunk_start=(\d{8}T\d{6}(?:\.\d{6})?)_"
+    r"chunk_end=(\d{8}T\d{6}(?:\.\d{6})?)"
 )
 
 
@@ -445,7 +447,8 @@ def load_intervals(
         if "price_mode" not in physical_cols:
             config = location.config or {}
             manifest_labels_mode = (
-                config.get("cache_config_version") == 2
+                config.get("cache_config_version")
+                in SUPPORTED_CACHE_CONFIG_VERSIONS
                 and config.get("exchange") == inst["exchange"]
                 and config.get("market_type") == inst["market_type"]
                 and config.get("symbol") == inst["symbol"]
@@ -579,8 +582,16 @@ def parse_chunk_span(path: Path) -> tuple[int, int] | None:
     if match is None:
         return None
     try:
-        start = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
-        end = datetime.strptime(match.group(2), "%Y%m%dT%H%M%S")
+        start_text = match.group(1)
+        end_text = match.group(2)
+        start = datetime.strptime(
+            start_text,
+            "%Y%m%dT%H%M%S.%f" if "." in start_text else "%Y%m%dT%H%M%S",
+        )
+        end = datetime.strptime(
+            end_text,
+            "%Y%m%dT%H%M%S.%f" if "." in end_text else "%Y%m%dT%H%M%S",
+        )
     except ValueError:
         return None
     start_ns = dt_to_ns(start)
@@ -773,12 +784,45 @@ def validate_cache_location(
                 f"Missing max_interval_ms in {manifest}; a safe partition "
                 "lookahead cannot be inferred",
             )
-        if config.get("cache_config_version") != 2:
+        if config.get("cache_config_version") not in SUPPORTED_CACHE_CONFIG_VERSIONS:
             validation_issue(
                 policy,
                 f"Unsupported cache_config_version={config.get('cache_config_version')!r} "
-                f"in {manifest}; expected 2",
+                f"in {manifest}; expected one of "
+                f"{sorted(SUPPORTED_CACHE_CONFIG_VERSIONS)}",
             )
+        if config.get("cache_config_version") == 4:
+            if config.get("timestamp_basis") not in {
+                "receive",
+                "event",
+                "transaction",
+                "custom",
+            }:
+                validation_issue(
+                    policy,
+                    f"Missing/invalid timestamp_basis in {manifest}",
+                )
+            if config.get("duplicate_ts_policy") not in {
+                "error",
+                "keep-last",
+            }:
+                validation_issue(
+                    policy,
+                    f"Missing/invalid duplicate_ts_policy in {manifest}",
+                )
+            if not config.get("timestamp_col"):
+                validation_issue(
+                    policy,
+                    f"Missing timestamp_col in {manifest}",
+                )
+            if (
+                config.get("duplicate_ts_policy") == "keep-last"
+                and not config.get("dedup_order_by")
+            ):
+                validation_issue(
+                    policy,
+                    f"Missing dedup_order_by in {manifest}",
+                )
         expected = {
             "exchange": inst["exchange"],
             "market_type": inst["market_type"],
@@ -796,7 +840,10 @@ def validate_cache_location(
                 f"Cache config identity mismatch in {manifest}: {mismatches}",
             )
         else:
-            manifest_identity_valid = config.get("cache_config_version") == 2
+            manifest_identity_valid = (
+                config.get("cache_config_version")
+                in SUPPORTED_CACHE_CONFIG_VERSIONS
+            )
 
         try:
             config_start_ns = parse_config_ns(config, "start", manifest)
@@ -935,6 +982,15 @@ def cache_identity(location: CacheLocation) -> dict[str, object]:
         ),
         "drop_zero_returns": (
             config.get("drop_zero_returns") if config is not None else None
+        ),
+        "timestamp_basis": (
+            config.get("timestamp_basis") if config is not None else None
+        ),
+        "timestamp_col": (
+            config.get("timestamp_col") if config is not None else None
+        ),
+        "duplicate_ts_policy": (
+            config.get("duplicate_ts_policy") if config is not None else None
         ),
         "cache_config_hash": (
             stable_config_hash(config) if config is not None else None
@@ -1784,6 +1840,25 @@ def main() -> None:
         key: cache_identity(location)
         for key, location in cache_locations.items()
     }
+    timestamp_bases = {
+        identity["timestamp_basis"] for identity in cache_identities.values()
+    }
+    duplicate_ts_policies = {
+        identity["duplicate_ts_policy"]
+        for identity in cache_identities.values()
+    }
+    if len(timestamp_bases) != 1:
+        raise CacheIntegrityError(
+            "Selected caches mix timestamp bases: "
+            f"{sorted(timestamp_bases, key=lambda value: str(value))}"
+        )
+    if len(duplicate_ts_policies) != 1:
+        raise CacheIntegrityError(
+            "Selected caches mix duplicate timestamp policies: "
+            f"{sorted(duplicate_ts_policies, key=lambda value: str(value))}"
+        )
+    timestamp_basis = next(iter(timestamp_bases))
+    duplicate_ts_policy = next(iter(duplicate_ts_policies))
     excluded_ranges_by_key = {
         key: cache_excluded_ranges(location)
         for key, location in cache_locations.items()
@@ -1799,6 +1874,8 @@ def main() -> None:
     research_config = {
         "script_version": SCRIPT_VERSION,
         "price_mode": args.price_mode,
+        "timestamp_basis": timestamp_basis,
+        "duplicate_ts_policy": duplicate_ts_policy,
         "window_hours": args.window_hours,
         "max_lag_ms": args.max_lag_ms,
         "lag_step_ms": args.lag_step_ms,

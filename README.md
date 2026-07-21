@@ -33,6 +33,31 @@ Hours containing multiple compacted files are recorded as abnormal and excluded 
 
 Raw market data is not included in this repository.
 
+The current compacted BBO schemas store `recv_time_us` (Binance perpetuals)
+and `recv_time_ns` (Binance Spot and Bybit perpetuals) as
+`TIMESTAMP WITH TIME ZONE`.  The suffix is part of the source field name; it
+does not mean that the Parquet value should be converted from an integer epoch.
+Use the default `--ts-unit timestamp` and allow per-instrument timestamp-column
+selection unless processing one homogeneous source explicitly.
+
+The research clock is explicit and immutable within one run:
+
+- `receive`: local collector receive time
+- `event`: exchange event time
+- `transaction`: exchange transaction time
+
+Event and transaction timestamps are not unique in every feed. The pipeline's
+`keep-last` policy retains one BBO per `(symbol, selected_timestamp)`, ordered
+by exchange sequence fields (`cross_seq`, then `update_id` when available),
+then exchange/receive timestamps and deterministic price/quantity tie-breakers.
+Returns are calculated only after this selection and an explicit timestamp
+sort. Cache format v4 records the clock, timestamp column, deduplication policy,
+and ordering rule, preventing incompatible caches from being combined.
+
+Binance Spot has no `transaction_time` in the current compacted schema.
+`01_build_universe.py --timestamp-basis transaction` therefore excludes it
+and records `missing_transaction_timestamp` in `ignored_instruments.csv`.
+
 ## Pipeline
 
 The scripts are intended to run in numerical order.
@@ -43,6 +68,8 @@ The scripts are intended to run in numerical order.
 
 - `universe.csv`
 - `excluded_hours.csv`
+- `ignored_instruments.csv`
+- `pairs.csv`
 - `task_config.json`
 
 The current grouping rule is:
@@ -155,8 +182,8 @@ python -m pip install -r requirements.txt
 The current dependencies are:
 
 ```text
-duckdb
-numpy
+duckdb>=1.4.0,<2.0.0
+numpy>=1.26.0,<3.0.0
 ```
 
 ## Minimal run example
@@ -173,7 +200,8 @@ Build the universe:
 ```bash
 python 01_build_universe.py \
   --root /path/to/market_data_compacted \
-  --out ./run
+  --out ./run \
+  --timestamp-basis receive
 ```
 
 Scan hourly data quality:
@@ -207,12 +235,45 @@ python 04_build_interval_cache_lowram_fixed.py \
   --out ./run/interval_cache \
   --start 2026-06-26T00:00:00Z \
   --end 2026-07-10T00:00:00Z \
+  --max-lag-ms 100 \
   --price-mode mid \
   --chunk-minutes 60 \
   --threads 1 \
   --memory-limit 2GB \
   --temp-dir ./duckdb_tmp
 ```
+
+Stage 04 treats `--start` and `--end` as the intended analysis range and
+automatically expands cache coverage by `--max-lag-ms` on both sides. Use the
+same maximum lag in stages 04 and 05. Source Parquet must exist for the expanded
+range; strict stage-05 validation intentionally fails rather than silently
+dropping edge observations.
+
+## Event-time and transaction-time variants
+
+Use a separate run directory and cache root for each clock. For event time,
+pass the following options to stages 01, 02, and 04:
+
+```text
+01: --timestamp-basis event
+02: --timestamp-basis event --duplicate-ts-policy keep-last
+04: --timestamp-basis event --duplicate-ts-policy keep-last
+```
+
+For transaction time:
+
+```text
+01: --timestamp-basis transaction
+02: --timestamp-basis transaction --duplicate-ts-policy keep-last \
+    --missing-timestamp-policy skip
+04: --timestamp-basis transaction --duplicate-ts-policy keep-last
+```
+
+Stages 03, 05, and 06 do not need a timestamp command-line option: stage 03
+propagates the quality contract, stage 04 writes it into every cache manifest,
+stage 05 validates that selected caches use one clock/policy and includes both
+in its research configuration hash, and stage 06 validates that hash before
+combining shards.
 
 Compute one pair shard:
 
@@ -240,7 +301,7 @@ Summarize the component files:
 python 06_summarize_pair_hy_best.py \
   --components "./run/hy_pair_components/*.parquet" \
   --out ./run/hy_pair_summary \
-  --expected-pairs 0 \
+  --pairs-csv ./run/pairs.csv \
   --min-overlap 100 \
   --threads 1 \
   --memory-limit 2GB \
@@ -256,6 +317,12 @@ For example, a peak at `lag_ms = 30` means that shifting X forward by 30 millise
 ## Interpretation
 
 The reported correlation is a diagnostic measure of lagged co-movement. It should not be interpreted as evidence of causality or as a trading strategy on its own.
+
+HY covariance combined with separately estimated realized variances is not
+guaranteed to produce a positive-semidefinite finite-sample correlation matrix.
+Consequently `agg_corr` can fall outside `[-1, 1]`. Summary outputs preserve
+`corr_is_diagnostic` and provide `corr_outside_unit_interval`; values are never
+silently clipped.
 
 A candidate relationship should also be checked across:
 
@@ -273,6 +340,7 @@ Peaks at the edge of the lag search range, isolated single-lag spikes, and resul
 Implemented:
 
 - hourly universe construction
+- explicit reporting of discovered non-target instruments
 - data-quality scanning
 - adaptive interval and spread caps
 - boundary-aware interval cache construction
@@ -280,11 +348,11 @@ Implemented:
 - low-memory and disk-safety controls
 - configuration validation
 - multi-window result aggregation
+- instrument/cache/estimator contract tests
 
 Planned:
 
 - synthetic reproducibility example
-- automated estimator tests
 - grid-correlation comparison
 - mid-price versus microprice report
 - skip-sampled and pre-averaged HY robustness checks

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Scan ordered hourly Parquet files and write one statistics row per file.
+"""Scan hourly BBO Parquet files and write one statistics row per file.
 
-The compacted files are required to be ascending by the selected receive-time
-column.  Each file uses two sequential, narrow streaming passes and is never
-sorted.  A backward timestamp check aborts instead of silently producing
-incorrect gap statistics if the ordering contract is violated.
+Receive time can use the low-RAM physical-order path. Event and transaction
+time can contain repeated timestamps, so the keep-last path deterministically
+selects the final BBO update at each timestamp before computing gaps/returns.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import glob
+import hashlib
+import json
 import math
 import os
 import shutil
@@ -20,17 +21,34 @@ from typing import Any
 
 import duckdb
 
-from common import load_excluded_hours, resolve_excluded_hours_path
+from common import (
+    choose_timestamp_basis_col,
+    load_excluded_hours,
+    order_cols_for_dedup,
+    resolve_excluded_hours_path,
+)
 
+
+SCRIPT_VERSION = "2.2.0"
 
 PUBLIC_COLUMNS = [
     "exchange",
     "market_type",
     "symbol",
     "parquet_glob",
+    "timestamp_basis",
     "timestamp_col",
+    "duplicate_ts_policy",
+    "scan_config_hash",
+    "scan_ts_unit",
+    "scan_price_mode",
+    "scan_max_spread_bps",
+    "scan_start",
+    "scan_end",
     "file_path",
     "total_rows",
+    "selected_rows",
+    "deduplicated_rows",
     "clean_rows",
     "first_ts",
     "last_ts",
@@ -107,6 +125,32 @@ def double_literal(value: float | None) -> str:
     return f"CAST({value!r} AS DOUBLE)"
 
 
+def sha256_file(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable_config_hash(value: object) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def write_json_atomic(path: Path, value: object) -> None:
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    partial.replace(path)
+
+
 def read_universe(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -160,38 +204,6 @@ def get_columns(con: duckdb.DuckDBPyConnection, path: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def choose_timestamp_col(columns: list[str], requested: str | None) -> str:
-    lookup = {column.lower(): column for column in columns}
-    if requested:
-        if requested not in columns:
-            raise ValueError(
-                f"timestamp column {requested!r} not found; columns={columns}"
-            )
-        return requested
-    for candidate in (
-        "recv_time_ns",
-        "recv_time_us",
-        "recv_time_ms",
-        "recv_time",
-        "receive_time",
-        "receive_ts",
-        "received_ts",
-        "recv_ts",
-        "ts",
-        "timestamp",
-        "exchange_ts",
-        "event_ts",
-        "event_time",
-        "datetime",
-        "time",
-    ):
-        if candidate in lookup:
-            return lookup[candidate]
-    raise ValueError(
-        "cannot choose timestamp column automatically; use --timestamp-col"
-    )
-
-
 def build_ts_expr(column: str, unit: str) -> str:
     name = quote_identifier(column)
     if unit == "timestamp":
@@ -225,10 +237,10 @@ def connect(args: argparse.Namespace) -> duckdb.DuckDBPyConnection:
 
 def price_sql(price_mode: str) -> str:
     if price_mode == "mid":
-        return "(bid_price + ask_price) / 2.0"
+        return "(_bid_price + _ask_price) / 2.0"
     return (
-        "(bid_price * ask_qty + ask_price * bid_qty) "
-        "/ (bid_qty + ask_qty)"
+        "(_bid_price * _ask_qty + _ask_price * _bid_qty) "
+        "/ (_bid_qty + _ask_qty)"
     )
 
 
@@ -239,16 +251,48 @@ def common_ctes(
     time_filter: str,
     price_mode: str,
     max_spread_bps: float,
+    dedup_order_by: str,
+    duplicate_ts_policy: str,
 ) -> str:
     price = price_sql(price_mode)
+    if duplicate_ts_policy == "keep-last":
+        selection_ctes = f"""
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ts ORDER BY {dedup_order_by}
+                ) AS _dedup_rank
+            FROM marked
+            WHERE ts IS NOT NULL AND isfinite(ts)
+        ),
+        selected AS (
+            SELECT * EXCLUDE (_dedup_rank)
+            FROM ranked
+            WHERE _dedup_rank = 1
+        )
+        """
+    elif duplicate_ts_policy == "error":
+        selection_ctes = """
+        selected AS (
+            SELECT *
+            FROM marked
+            WHERE ts IS NOT NULL AND isfinite(ts)
+        )
+        """
+    else:
+        raise ValueError(
+            f"unsupported duplicate timestamp policy: {duplicate_ts_policy}"
+        )
     return f"""
         raw AS (
             SELECT
+                *,
                 {ts_expr} AS ts,
-                TRY_CAST(bid_price AS DOUBLE) AS bid_price,
-                TRY_CAST(ask_price AS DOUBLE) AS ask_price,
-                TRY_CAST(bid_qty AS DOUBLE) AS bid_qty,
-                TRY_CAST(ask_qty AS DOUBLE) AS ask_qty
+                TRY_CAST(bid_price AS DOUBLE) AS _bid_price,
+                TRY_CAST(ask_price AS DOUBLE) AS _ask_price,
+                TRY_CAST(bid_qty AS DOUBLE) AS _bid_qty,
+                TRY_CAST(ask_qty AS DOUBLE) AS _ask_qty
             FROM {scan_expr(file_path)}
             WHERE CAST(symbol AS VARCHAR) = {sql_quote(symbol)}
         ),
@@ -259,41 +303,40 @@ def common_ctes(
             SELECT
                 *,
                 CASE
-                    WHEN bid_price > 0 AND ask_price > 0
-                     AND isfinite(bid_price) AND isfinite(ask_price)
-                    THEN 10000.0 * (ask_price - bid_price)
-                         / ((bid_price + ask_price) / 2.0)
+                    WHEN _bid_price > 0 AND _ask_price > 0
+                     AND isfinite(_bid_price) AND isfinite(_ask_price)
+                    THEN 10000.0 * (_ask_price - _bid_price)
+                         / ((_bid_price + _ask_price) / 2.0)
                 END AS spread_bps,
                 CASE
-                    WHEN bid_price > 0 AND ask_price > 0
-                     AND bid_qty > 0 AND ask_qty > 0
-                     AND isfinite(bid_price) AND isfinite(ask_price)
-                     AND isfinite(bid_qty) AND isfinite(ask_qty)
+                    WHEN _bid_price > 0 AND _ask_price > 0
+                     AND _bid_qty > 0 AND _ask_qty > 0
+                     AND isfinite(_bid_price) AND isfinite(_ask_price)
+                     AND isfinite(_bid_qty) AND isfinite(_ask_qty)
                     THEN {price}
                 END AS price
             FROM filtered
         ),
         marked AS (
             SELECT
-                ts,
-                price,
-                spread_bps,
+                *,
                 ts IS NOT NULL
-                AND bid_price > 0 AND ask_price > 0
-                AND bid_qty > 0 AND ask_qty > 0
-                AND isfinite(bid_price) AND isfinite(ask_price)
-                AND isfinite(bid_qty) AND isfinite(ask_qty)
-                AND ask_price > bid_price
+                AND _bid_price > 0 AND _ask_price > 0
+                AND _bid_qty > 0 AND _ask_qty > 0
+                AND isfinite(_bid_price) AND isfinite(_ask_price)
+                AND isfinite(_bid_qty) AND isfinite(_ask_qty)
+                AND _ask_price > _bid_price
                 AND spread_bps BETWEEN 0 AND {max_spread_bps!r}
                 AND price > 0 AND isfinite(price) AS is_clean,
-                bid_price > ask_price AS is_crossed,
-                bid_price = ask_price AND bid_price > 0 AS is_locked,
-                bid_price <= 0 AS has_non_positive_bid,
-                ask_price <= 0 AS has_non_positive_ask,
-                bid_qty <= 0 AS has_non_positive_bid_qty,
-                ask_qty <= 0 AS has_non_positive_ask_qty
+                _bid_price > _ask_price AS is_crossed,
+                _bid_price = _ask_price AND _bid_price > 0 AS is_locked,
+                _bid_price <= 0 AS has_non_positive_bid,
+                _ask_price <= 0 AS has_non_positive_ask,
+                _bid_qty <= 0 AS has_non_positive_bid_qty,
+                _ask_qty <= 0 AS has_non_positive_ask_qty
             FROM enriched
-        )
+        ),
+        {selection_ctes}
     """
 
 
@@ -307,6 +350,8 @@ def scan_base_stats(
     max_spread_bps: float,
     previous_valid_ts: datetime | None,
     previous_input_ts: datetime | None,
+    dedup_order_by: str,
+    duplicate_ts_policy: str,
 ) -> dict[str, Any]:
     """Calculate base quality fields and verify the ascending-time contract."""
     ctes = common_ctes(
@@ -316,6 +361,8 @@ def scan_base_stats(
         time_filter,
         price_mode,
         max_spread_bps,
+        dedup_order_by,
+        duplicate_ts_policy,
     )
     query = f"""
         WITH {ctes},
@@ -323,12 +370,12 @@ def scan_base_stats(
             SELECT *, LAG(ts) OVER () AS file_prev_ts
             FROM marked
         ),
-        agg AS (
+        raw_agg AS (
             SELECT
                 COUNT(*) AS total_rows,
-                COUNT(*) FILTER (WHERE is_clean) AS clean_rows,
-                MIN(ts) AS first_ts,
-                MAX(ts) AS last_ts,
+                COUNT(*) FILTER (
+                    WHERE ts IS NOT NULL AND isfinite(ts)
+                ) AS valid_timestamp_rows,
                 COUNT(*) FILTER (
                     WHERE ts = COALESCE(
                         file_prev_ts, {ts_literal(previous_valid_ts)}
@@ -353,28 +400,44 @@ def scan_base_stats(
                 COUNT(*) FILTER (
                     WHERE has_non_positive_ask_qty
                 ) AS non_positive_ask_qty,
+                MAX(ts) FILTER (WHERE ts IS NOT NULL) AS file_max_valid_ts,
+                MAX(ts) FILTER (WHERE ts IS NOT NULL) AS file_last_input_ts
+            FROM input_window
+        ),
+        selected_agg AS (
+            SELECT
+                COUNT(*) AS selected_rows,
+                COUNT(*) FILTER (WHERE is_clean) AS clean_rows,
+                MIN(ts) AS first_ts,
+                MAX(ts) AS last_ts,
                 approx_quantile(
                     spread_bps, [0.50, 0.99]::FLOAT[]
                 ) FILTER (
                     WHERE spread_bps >= 0 AND isfinite(spread_bps)
                 ) AS spread_q,
-                MAX(ts) FILTER (WHERE ts IS NOT NULL) AS file_max_valid_ts,
-                MAX(ts) FILTER (WHERE ts IS NOT NULL) AS file_last_input_ts,
                 MAX(ts) FILTER (WHERE is_clean) AS file_last_clean_ts,
-                LAST(price) FILTER (WHERE is_clean) AS file_last_clean_price
-            FROM input_window
+                arg_max(price, ts) FILTER (
+                    WHERE is_clean
+                ) AS file_last_clean_price
+            FROM selected
         )
         SELECT
-            total_rows, clean_rows, first_ts, last_ts,
-            duplicate_ts, backward_ts,
+            raw_agg.total_rows,
+            raw_agg.valid_timestamp_rows,
+            selected_agg.selected_rows,
+            selected_agg.clean_rows,
+            selected_agg.first_ts,
+            selected_agg.last_ts,
+            raw_agg.duplicate_ts AS physical_duplicate_ts,
+            backward_ts,
             crossed_rows, locked_rows,
             non_positive_bid, non_positive_ask,
             non_positive_bid_qty, non_positive_ask_qty,
-            spread_q[1] AS spread_bps_p50,
-            spread_q[2] AS spread_bps_p99,
+            selected_agg.spread_q[1] AS spread_bps_p50,
+            selected_agg.spread_q[2] AS spread_bps_p99,
             file_max_valid_ts, file_last_input_ts,
             file_last_clean_ts, file_last_clean_price
-        FROM agg
+        FROM raw_agg CROSS JOIN selected_agg
     """
     cursor = con.execute(query)
     names = [item[0] for item in cursor.description]
@@ -382,10 +445,32 @@ def scan_base_stats(
     if values is None:
         raise RuntimeError(f"base statistics returned no row: {file_path}")
     result = dict(zip(names, values))
-    if result["backward_ts"] > 0:
+    local_deduplicated = max(
+        0,
+        int(result.pop("valid_timestamp_rows"))
+        - int(result["selected_rows"]),
+    )
+    boundary_duplicate = int(
+        previous_valid_ts is not None
+        and result["first_ts"] == previous_valid_ts
+    )
+    if duplicate_ts_policy == "keep-last":
+        result["duplicate_ts"] = local_deduplicated + boundary_duplicate
+        result["deduplicated_rows"] = result["duplicate_ts"]
+    else:
+        result["duplicate_ts"] = int(result.pop("physical_duplicate_ts"))
+        result["deduplicated_rows"] = result["duplicate_ts"]
+    result.pop("physical_duplicate_ts", None)
+    if duplicate_ts_policy == "error" and result["backward_ts"] > 0:
         raise RuntimeError(
-            f"receive time is not ascending in {file_path}: "
+            f"selected timestamp is not ascending in {file_path}: "
             f"backward_ts={result['backward_ts']}"
+        )
+    if duplicate_ts_policy == "error" and result["duplicate_ts"] > 0:
+        raise RuntimeError(
+            f"duplicate selected timestamps in {file_path}: "
+            f"duplicate_ts={result['duplicate_ts']}; use "
+            "--duplicate-ts-policy keep-last for event/transaction time"
         )
     return result
 
@@ -400,6 +485,8 @@ def scan_clean_time_stats(
     max_spread_bps: float,
     previous_clean_ts: datetime | None,
     previous_clean_price: float | None,
+    dedup_order_by: str,
+    duplicate_ts_policy: str,
 ) -> dict[str, Any]:
     """Calculate clean gaps and returns in a second, narrow streaming pass."""
     ctes = common_ctes(
@@ -409,20 +496,22 @@ def scan_clean_time_stats(
         time_filter,
         price_mode,
         max_spread_bps,
+        dedup_order_by,
+        duplicate_ts_policy,
     )
     query = f"""
         WITH {ctes},
         clean AS (
             SELECT ts, price
-            FROM marked
+            FROM selected
             WHERE is_clean
         ),
         clean_window AS (
             SELECT
                 ts,
                 price,
-                LAG(ts) OVER () AS file_prev_ts,
-                LAG(price) OVER () AS file_prev_price
+                LAG(ts) OVER (ORDER BY ts) AS file_prev_ts,
+                LAG(price) OVER (ORDER BY ts) AS file_prev_price
             FROM clean
         ),
         metrics AS (
@@ -552,6 +641,32 @@ def main() -> None:
     parser.add_argument("--end")
     parser.add_argument("--timestamp-col")
     parser.add_argument(
+        "--timestamp-basis",
+        choices=["receive", "event", "transaction"],
+        help=(
+            "Clock used by HY. Defaults to receive unless --timestamp-col is "
+            "provided, in which case the basis is recorded as custom."
+        ),
+    )
+    parser.add_argument(
+        "--duplicate-ts-policy",
+        choices=["error", "keep-last"],
+        default="error",
+        help=(
+            "How to handle repeated selected timestamps. Event/transaction "
+            "runs should use keep-last."
+        ),
+    )
+    parser.add_argument(
+        "--missing-timestamp-policy",
+        choices=["error", "skip"],
+        default="error",
+        help=(
+            "Use skip for transaction-time runs so Binance Spot, whose schema "
+            "has no transaction_time, is excluded explicitly."
+        ),
+    )
+    parser.add_argument(
         "--ts-unit",
         choices=["timestamp", "ns", "us", "ms"],
         default="timestamp",
@@ -577,6 +692,12 @@ def main() -> None:
         help="Continue an existing partial CSV and skip completed rows.",
     )
     args = parser.parse_args()
+
+    if args.timestamp_col and args.timestamp_basis:
+        parser.error("use either --timestamp-col or --timestamp-basis, not both")
+    timestamp_basis = (
+        "custom" if args.timestamp_col else (args.timestamp_basis or "receive")
+    )
 
     if args.threads != 1:
         parser.error(
@@ -608,8 +729,54 @@ def main() -> None:
 
     args.temp_dir = Path(args.temp_dir).expanduser().resolve()
     partial_out = Path(args.partial_out).expanduser().resolve()
+    config_path = partial_out.with_name(partial_out.name + ".CONFIG.json")
     args.temp_dir.mkdir(parents=True, exist_ok=True)
     partial_out.parent.mkdir(parents=True, exist_ok=True)
+
+    scan_config = {
+        "script_version": SCRIPT_VERSION,
+        "universe_path": str(universe_path),
+        "universe_sha256": sha256_file(universe_path),
+        "excluded_hours_path": str(excluded_path) if excluded_path else None,
+        "excluded_hours_sha256": sha256_file(excluded_path),
+        "start": start.isoformat(timespec="microseconds") if start else None,
+        "end": end.isoformat(timespec="microseconds") if end else None,
+        "timestamp_basis": timestamp_basis,
+        "timestamp_col": args.timestamp_col,
+        "duplicate_ts_policy": args.duplicate_ts_policy,
+        "missing_timestamp_policy": args.missing_timestamp_policy,
+        "ts_unit": args.ts_unit,
+        "price_mode": args.price_mode,
+        "max_spread_bps": args.max_spread_bps,
+        "processing_mode": (
+            "ordered_keep_last"
+            if args.duplicate_ts_policy == "keep-last"
+            else "streaming_ascending_unique"
+        ),
+    }
+    scan_config_hash = stable_config_hash(scan_config)
+    config_document = {
+        "scan_config_hash": scan_config_hash,
+        "scan_config": scan_config,
+    }
+
+    if args.resume and partial_out.exists():
+        if not config_path.is_file():
+            raise RuntimeError(
+                f"existing partial CSV has no configuration manifest: {config_path}; "
+                "restart without --resume so incompatible scans cannot be mixed"
+            )
+        try:
+            existing_config = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read scan config {config_path}: {exc}") from exc
+        if existing_config != config_document:
+            raise RuntimeError(
+                f"resume configuration mismatch for {partial_out}; use a new "
+                "--partial-out or restart without --resume"
+            )
+    else:
+        write_json_atomic(config_path, config_document)
 
     time_filter = "TRUE"
     if start is not None:
@@ -649,6 +816,14 @@ def main() -> None:
                 writer.writeheader()
 
             for i, row in enumerate(rows, 1):
+                universe_basis = row.get("timestamp_basis")
+                if universe_basis and universe_basis != timestamp_basis:
+                    raise RuntimeError(
+                        f"universe timestamp_basis={universe_basis!r} for "
+                        f"{row['exchange']}/{row['market_type']}/"
+                        f"{row['symbol']}, but quality scan requested "
+                        f"{timestamp_basis!r}"
+                    )
                 excluded_hours = excluded_by_key.get(
                     (row["exchange"], row["market_type"], row["symbol"]),
                     set(),
@@ -677,17 +852,40 @@ def main() -> None:
                     continue
 
                 columns = get_columns(con, files[0])
-                timestamp_col = choose_timestamp_col(
-                    columns, args.timestamp_col
-                )
+                try:
+                    timestamp_col = choose_timestamp_basis_col(
+                        set(columns), timestamp_basis, args.timestamp_col
+                    )
+                except RuntimeError as exc:
+                    if args.missing_timestamp_policy == "skip":
+                        print(
+                            f"[WARN] {i}/{len(rows)} skip "
+                            f"{row['exchange']}/{row['market_type']}/"
+                            f"{row['symbol']}: {exc}"
+                        )
+                        continue
+                    raise
+                universe_timestamp_col = row.get("timestamp_col")
+                if (
+                    universe_timestamp_col
+                    and timestamp_col != universe_timestamp_col
+                ):
+                    raise RuntimeError(
+                        f"universe timestamp_col={universe_timestamp_col!r} "
+                        f"but schema resolved {timestamp_col!r} for "
+                        f"{row['exchange']}/{row['market_type']}/"
+                        f"{row['symbol']}"
+                    )
                 # Compacted hourly files for one instrument share a schema, so
                 # inspect it once instead of issuing DESCRIBE for every hour.
                 validate_file_columns(columns, files[0], timestamp_col)
                 ts_expr = build_ts_expr(timestamp_col, args.ts_unit)
+                dedup_order_by = order_cols_for_dedup(set(columns))
                 print(
                     f"[INFO] {i}/{len(rows)} "
                     f"{row['exchange']}/{row['market_type']}/{row['symbol']} "
-                    f"files={len(files)} ts={timestamp_col}"
+                    f"files={len(files)} basis={timestamp_basis} "
+                    f"ts={timestamp_col} dedup={args.duplicate_ts_policy}"
                 )
 
                 previous_valid_ts = None
@@ -749,6 +947,8 @@ def main() -> None:
                         args.max_spread_bps,
                         previous_valid_ts,
                         previous_input_ts,
+                        dedup_order_by,
+                        args.duplicate_ts_policy,
                     )
                     timing = scan_clean_time_stats(
                         con,
@@ -760,6 +960,8 @@ def main() -> None:
                         args.max_spread_bps,
                         previous_clean_ts,
                         previous_clean_price,
+                        dedup_order_by,
+                        args.duplicate_ts_policy,
                     )
 
                     result = {
@@ -767,11 +969,19 @@ def main() -> None:
                         "market_type": row["market_type"],
                         "symbol": row["symbol"],
                         "parquet_glob": row["parquet_glob"],
+                        "timestamp_basis": timestamp_basis,
                         "timestamp_col": timestamp_col,
+                        "duplicate_ts_policy": args.duplicate_ts_policy,
+                        "scan_config_hash": scan_config_hash,
+                        "scan_ts_unit": args.ts_unit,
+                        "scan_price_mode": args.price_mode,
+                        "scan_max_spread_bps": args.max_spread_bps,
+                        "scan_start": scan_config["start"],
+                        "scan_end": scan_config["end"],
                         "file_path": file_path,
                         **base,
                         **timing,
-                        "processing_mode": "streaming_ascending",
+                        "processing_mode": scan_config["processing_mode"],
                     }
                     writer.writerow({key: result.get(key) for key in PARTIAL_COLUMNS})
                     handle.flush()
@@ -800,7 +1010,10 @@ def main() -> None:
 
     print(f"[DONE] processed new files: {total_processed}")
     print(f"[DONE] wrote partial statistics: {partial_out}")
-    print("[DONE] ordered low-RAM path: two narrow passes per file, no sort")
+    print(
+        "[DONE] timestamp basis="
+        f"{timestamp_basis} duplicate policy={args.duplicate_ts_policy}"
+    )
     print("[NEXT] run 03_aggregate_quality.py on this partial CSV")
 
 

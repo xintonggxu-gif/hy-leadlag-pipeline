@@ -55,14 +55,67 @@ def main() -> None:
     try:
         con.execute(f"SET memory_limit = {sql_quote(args.memory_limit)}")
         con.execute("SET threads = 1")
+        source = f"""
+            read_csv_auto(
+                {sql_quote(str(partial))},
+                header = true,
+                sample_size = -1
+            )
+        """
+        columns = {
+            row[0]
+            for row in con.execute(
+                f"DESCRIBE SELECT * FROM {source}"
+            ).fetchall()
+        }
+        required_scan_columns = {
+            "scan_config_hash",
+            "timestamp_basis",
+            "duplicate_ts_policy",
+            "scan_ts_unit",
+            "scan_price_mode",
+            "scan_max_spread_bps",
+            "scan_start",
+            "scan_end",
+        }
+        missing_scan_columns = required_scan_columns - columns
+        if missing_scan_columns:
+            raise RuntimeError(
+                "partial quality CSV is missing scan configuration columns "
+                f"{sorted(missing_scan_columns)}; rebuild it with "
+                "02_scan_quality_low_memory.py v2.2+"
+            )
+        config_stats = con.execute(f"""
+            SELECT
+                count(DISTINCT scan_config_hash),
+                count(*) FILTER (WHERE scan_config_hash IS NULL)
+            FROM {source}
+        """).fetchone()
+        if config_stats is None or config_stats[0] != 1 or config_stats[1] != 0:
+            raise RuntimeError(
+                "partial quality CSV contains missing or mixed scan configurations"
+            )
+        inconsistent_timestamp = con.execute(f"""
+            SELECT exchange, market_type, symbol
+            FROM {source}
+            GROUP BY exchange, market_type, symbol
+            HAVING count(DISTINCT timestamp_basis) <> 1
+                OR count(DISTINCT timestamp_col) <> 1
+                OR count(DISTINCT duplicate_ts_policy) <> 1
+                OR count(*) FILTER (WHERE timestamp_basis IS NULL) > 0
+                OR count(*) FILTER (WHERE timestamp_col IS NULL) > 0
+                OR count(*) FILTER (WHERE duplicate_ts_policy IS NULL) > 0
+            LIMIT 1
+        """).fetchone()
+        if inconsistent_timestamp is not None:
+            raise RuntimeError(
+                "instrument has inconsistent timestamp columns in partial quality "
+                f"CSV: {inconsistent_timestamp}"
+            )
         query = f"""
             WITH hourly AS (
                 SELECT *
-                FROM read_csv_auto(
-                    {sql_quote(str(partial))},
-                    header = true,
-                    sample_size = -1
-                )
+                FROM {source}
             ),
             quality AS (
                 SELECT
@@ -70,9 +123,19 @@ def main() -> None:
                     market_type,
                     symbol,
                     ANY_VALUE(parquet_glob) AS parquet_glob,
+                    ANY_VALUE(timestamp_basis) AS timestamp_basis,
                     ANY_VALUE(timestamp_col) AS timestamp_col,
+                    ANY_VALUE(duplicate_ts_policy) AS duplicate_ts_policy,
+                    ANY_VALUE(scan_config_hash) AS scan_config_hash,
+                    ANY_VALUE(scan_ts_unit) AS scan_ts_unit,
+                    ANY_VALUE(scan_price_mode) AS scan_price_mode,
+                    ANY_VALUE(scan_max_spread_bps) AS scan_max_spread_bps,
+                    ANY_VALUE(scan_start) AS scan_start,
+                    ANY_VALUE(scan_end) AS scan_end,
                     COUNT(*) AS n_files_scanned,
                     SUM(total_rows) AS total_rows,
+                    SUM(selected_rows) AS selected_rows,
+                    SUM(deduplicated_rows) AS deduplicated_rows,
                     SUM(clean_rows) AS clean_rows,
                     MIN(first_ts) AS first_ts,
                     MAX(last_ts) AS last_ts,
@@ -106,9 +169,19 @@ def main() -> None:
                 market_type,
                 symbol,
                 parquet_glob,
+                timestamp_basis,
                 timestamp_col,
+                duplicate_ts_policy,
+                scan_config_hash,
+                scan_ts_unit,
+                scan_price_mode,
+                scan_max_spread_bps,
+                scan_start,
+                scan_end,
                 n_files_scanned,
                 total_rows,
+                selected_rows,
+                deduplicated_rows,
                 clean_rows,
                 first_ts,
                 last_ts,

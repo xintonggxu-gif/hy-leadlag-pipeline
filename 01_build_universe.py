@@ -6,13 +6,20 @@ from collections import defaultdict
 from itertools import chain
 from pathlib import Path
 
-from common import write_csv_rows, write_json
+import duckdb
+
+from common import (
+    build_scan_expr,
+    choose_timestamp_basis_col,
+    get_columns,
+    write_csv_rows,
+    write_json,
+)
 
 TARGET_INSTRUMENTS: dict[tuple[str, str, str], str] = {
     # Binance spot (group B).
     ("binance", "spot", "XRPUSDT"): "XRP",
     ("binance", "spot", "DOGEUSDT"): "DOGE",
-    ("binance", "spot", "FARTCOINUSDT"): "FARTCOIN",
     ("binance", "spot", "ETHUSDT"): "ETH",
     ("binance", "spot", "SOLUSDT"): "SOL",
     ("binance", "spot", "PEPEUSDT"): "1000PEPE",
@@ -38,17 +45,20 @@ TARGET_INSTRUMENTS: dict[tuple[str, str, str], str] = {
     ("binance", "perp", "USDCUSDT"): "USDC",
 
     # Bybit linear contracts are stored under market_type=perp (group B).
+    # The generic PERP symbols below are real source symbols, not aliases for the
+    # USDT contracts, so retain both variants as distinct instruments.
     ("bybit", "perp", "XRPUSDT"): "XRP",
+    ("bybit", "perp", "XRPPERP"): "XRP",
     ("bybit", "perp", "DOGEUSDT"): "DOGE",
+    ("bybit", "perp", "DOGEPERP"): "DOGE",
     ("bybit", "perp", "FARTCOINUSDT"): "FARTCOIN",
     ("bybit", "perp", "ETHUSDT"): "ETH",
+    ("bybit", "perp", "ETHPERP"): "ETH",
     ("bybit", "perp", "SOLUSDT"): "SOL",
+    ("bybit", "perp", "SOLPERP"): "SOL",
     ("bybit", "perp", "1000PEPEUSDT"): "1000PEPE",
-    ("bybit", "perp", "XRPUSDC"): "XRP",
-    ("bybit", "perp", "DOGEUSDC"): "DOGE",
-    ("bybit", "perp", "ETHUSDC"): "ETH",
-    ("bybit", "perp", "SOLUSDC"): "SOL",
-    ("bybit", "perp", "1000PEPEUSDC"): "1000PEPE",
+    ("bybit", "perp", "1000PEPEPERP"): "1000PEPE",
+    ("bybit", "perp", "USDCUSDT"): "USDC",
 }
 
 
@@ -115,6 +125,15 @@ def main() -> None:
     parser.add_argument("--market-type", action="append", help="Optional market-type filter; repeatable.")
     parser.add_argument("--symbol", action="append", help="Optional symbol filter; repeatable.")
     parser.add_argument("--date", action="append", help="Optional YYYY-MM-DD partition filter; repeatable.")
+    parser.add_argument(
+        "--timestamp-basis",
+        choices=["receive", "event", "transaction"],
+        default="receive",
+        help=(
+            "Keep only instruments whose compacted schema supports this HY "
+            "clock. Binance Spot is excluded from transaction runs."
+        ),
+    )
     args = parser.parse_args()
 
     selected_exchanges = {value.lower() for value in args.exchange or []}
@@ -131,6 +150,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     grouped: dict[tuple[str, str, str, str], dict] = {}
+    ignored_instruments: dict[tuple[str, str, str], str] = {}
     hour_file_counts: dict[
         tuple[str, str, str, str, str, str], int
     ] = defaultdict(int)
@@ -166,6 +186,7 @@ def main() -> None:
 
         base_asset = TARGET_INSTRUMENTS.get(target_key)
         if base_asset is None:
+            ignored_instruments[target_key] = "not_in_target_instruments"
             continue
 
         key = (rec["exchange"], rec["market_type"], rec["feed"], rec["symbol"])
@@ -199,9 +220,40 @@ def main() -> None:
                 "base_asset": base_asset,
                 "group": assign_group(rec["exchange"], rec["market_type"]),
                 "parquet_glob": str(parquet_glob),
+                "_schema_file": str(path),
             }
 
         hour_file_counts[(*key, rec["date"], rec["hour"])] += 1
+
+    # Resolve one explicit research clock per instrument. Do not silently use
+    # event time when transaction time is absent (or vice versa).
+    schema_con = duckdb.connect()
+    try:
+        for key in list(grouped):
+            base = grouped[key]
+            schema_file = str(base.pop("_schema_file"))
+            columns = get_columns(
+                schema_con, build_scan_expr(schema_file, True)
+            )
+            try:
+                timestamp_col = choose_timestamp_basis_col(
+                    columns, args.timestamp_basis
+                )
+            except RuntimeError:
+                target_key = (
+                    str(base["exchange"]).lower(),
+                    str(base["market_type"]).lower(),
+                    str(base["symbol"]).upper(),
+                )
+                ignored_instruments[target_key] = (
+                    f"missing_{args.timestamp_basis}_timestamp"
+                )
+                del grouped[key]
+                continue
+            base["timestamp_basis"] = args.timestamp_basis
+            base["timestamp_col"] = timestamp_col
+    finally:
+        schema_con.close()
 
     # The hourly pipeline contract is exactly one Parquet file per instrument
     # hour.  A directory containing many five-second compact files is excluded
@@ -212,6 +264,8 @@ def main() -> None:
     for hour_key, file_count in sorted(hour_file_counts.items()):
         exchange, market_type, feed, symbol, date, hour = hour_key
         instrument_hour_key = (exchange, market_type, feed, symbol)
+        if instrument_hour_key not in grouped:
+            continue
         if file_count == 1:
             hours_by_key[instrument_hour_key].add(f"{date} {hour}")
             continue
@@ -242,6 +296,7 @@ def main() -> None:
 
     universe_csv = out_dir / "universe.csv"
     excluded_hours_csv = out_dir / "excluded_hours.csv"
+    ignored_instruments_csv = out_dir / "ignored_instruments.csv"
     write_csv_rows(
         excluded_hours_csv,
         excluded_hour_rows,
@@ -257,6 +312,21 @@ def main() -> None:
         ],
     )
     write_csv_rows(
+        ignored_instruments_csv,
+        [
+            {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "reason": reason,
+            }
+            for (exchange, market_type, symbol), reason in sorted(
+                ignored_instruments.items()
+            )
+        ],
+        ["exchange", "market_type", "symbol", "reason"],
+    )
+    write_csv_rows(
         universe_csv,
         rows,
         [
@@ -268,6 +338,8 @@ def main() -> None:
             "base_asset",
             "group",
             "parquet_glob",
+            "timestamp_basis",
+            "timestamp_col",
             "first_hour",
             "last_hour",
             "n_hours",
@@ -315,8 +387,10 @@ def main() -> None:
         {
             "raw_root": str(root),
             "feed": args.feed,
+            "timestamp_basis": args.timestamp_basis,
             "universe_csv": str(universe_csv),
             "excluded_hours_csv": str(excluded_hours_csv),
+            "ignored_instruments_csv": str(ignored_instruments_csv),
             "pairs_csv": str(pairs_csv),
             "quality_csv": str(out_dir / "instrument_quality.csv"),
             "interval_cache_dir": str(out_dir / "interval_cache"),
@@ -348,8 +422,10 @@ def main() -> None:
     print(f"[DONE] group_B={n_group_b}")
     print(f"[DONE] eligible_same_asset_pairs={len(pair_rows)}")
     print(f"[DONE] excluded_abnormal_hours={len(excluded_hour_rows)}")
+    print(f"[DONE] ignored_instruments={len(ignored_instruments)}")
     print(f"[DONE] wrote {universe_csv}")
     print(f"[DONE] wrote {excluded_hours_csv}")
+    print(f"[DONE] wrote {ignored_instruments_csv}")
     print(f"[DONE] wrote {pairs_csv}")
     print(f"[DONE] wrote {out_dir / 'task_config.json'}")
 

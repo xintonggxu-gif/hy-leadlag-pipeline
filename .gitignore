@@ -20,3 +20,6 @@ duckdb_tmp/
 # Temporary files
 *.tmp
 *.lock
+
+# Confidential local research outputs
+/hy-results-*/

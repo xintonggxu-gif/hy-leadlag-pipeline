@@ -109,6 +109,39 @@ Pair jobs can be divided into shards with `--pair-offset` and `--pair-limit`.
 
 Configuration hashes and success markers are checked before different component files are combined.
 
+### 7. Audit receive-time latency
+
+`07_audit_receive_event_latency.py` measures local receive time minus exchange
+event time for Binance perpetual, Binance spot, and Bybit perpetual BBO files.
+It scans one hourly Parquet file at a time, supports safe resume, and writes
+hourly, daily, instrument, venue, and venue-by-base-asset summaries. The report
+compares Bybit perpetual against both Binance perpetual and Binance spot, as
+well as Binance perpetual against Binance spot, overall and for every shared
+base asset. This helps distinguish an apparent venue lead-lag from
+collector/network delay without confounding the comparison by venue or asset
+mix.
+
+Example:
+
+```bash
+python 07_audit_receive_event_latency.py \
+  --universe ./run/universe.csv \
+  --out ./run/receive_event_latency_audit \
+  --start 2026-07-01T09:00:00Z \
+  --end 2026-07-16T00:00:00Z \
+  --event-column event_time \
+  --threads 1 \
+  --memory-limit 2GB \
+  --temp-dir ./run/duckdb_tmp
+```
+
+The compacted `recv_time_us` and `recv_time_ns` columns are timestamps, not
+integer epochs. Positive latency means the local collector received the BBO
+after the exchange event timestamp. Exchange-level quantiles use the median of
+hourly per-event quantiles so that each instrument-hour has equal weight.
+
+Only the methodology and output schema are documented here; raw market data, instrument identifiers, and empirical findings are intentionally excluded.
+
 ## Installation
 
 Python 3.11 or later is recommended.
